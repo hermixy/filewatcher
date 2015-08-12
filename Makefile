@@ -45,6 +45,7 @@ CFLAGS	:= -g -Wall -fPIC
 CFLAGS	+= -Werror
 LDFLAGS	:= -lpthread
 LDFLAGS	+= -llog
+LDFLAGS	+= -ldict
 LDFLAGS	+= -lgevent
 
 .PHONY : all clean

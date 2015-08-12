@@ -13,6 +13,8 @@
 #include <dirent.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <libgzf.h>
+#include <libdict.h>
 #include <libgevent.h>
 #include <liblog.h>
 #include "uthash.h"
@@ -20,80 +22,90 @@
 #define WATCH_MOVED     1
 #define WATCH_MODIFY    1
 
-#define INOTIFYEVENTBUFSIZE (1024)
-#define FTP_ROOT_DIR		"/tmp/ftp"
+#define FTP_ROOT_DIR		"/tmp"
 
-static int g_ifd;
-static struct gevent_base *g_evbase;
-
-typedef struct wd_path {
+typedef struct path_dict {
     int wd;
     char path[PATH_MAX];
     UT_hash_handle hh;
-} wd_path_t;
+} path_dict_t;
 
-wd_path_t *dict = NULL;
+typedef struct fw {
+    int fd;
+    struct gevent_base *evbase;
+    struct path_dict *pdict;
+    dict *dict_path;
+} fw_t;
 
-int add_path_list(int wd, const char *path)
+static struct fw *_fw = NULL;
+
+int add_path_list(struct fw *fw, int wd, const char *path)
 {
-    wd_path_t *user = (wd_path_t *) malloc(sizeof(wd_path_t));
-    if (user == NULL) {
-        loge("malloc wd_path_t error\n");
-        return -1;
-    }
-    strcpy(user->path, path);
-    user->wd = wd;
-    HASH_ADD_INT(dict, wd, user);
+    char key[9];
+    memset(key, 0, sizeof(key));
+    snprintf(key, 9, "%d", wd);
+    char *val = CALLOC(PATH_MAX, char);
+    strncpy(val, path, PATH_MAX);
+    logd("dict_add key:val = %s:%s\n", key, val);
+    dict_add(fw->dict_path, key, val);
     return 0;
 }
 
-int del_path_list(int wd)
+int del_path_list(struct fw *fw, int wd)
 {
-    wd_path_t *p = NULL;
-    HASH_FIND_INT(dict, &wd, p);
-    if (!p) {
-        loge("can't find %d in hash table\n", wd);
-        return -1;
-    }
-    HASH_DEL(dict, p);
+    char key[9];
+    memset(key, 0, sizeof(key));
+    snprintf(key, sizeof(key), "%d", wd);
+    logd("dict_del key = %s\n", key);
+    dict_del(fw->dict_path, key);
     return 0;
 }
 
-int fw_add_watch(int fd, const char *path, uint32_t mask)
+int fw_add_watch(struct fw *fw, const char *path, uint32_t mask)
 {
+    int fd = fw->fd;
     int wd = inotify_add_watch(fd, path, mask);
     if (wd == -1) {
-        loge("inotify_add_watch %s failed: %d\n", path, errno);
+        loge("inotify_add_watch %s failed(%d): %s\n", path, errno, strerror(errno));
+        if (errno == ENOSPC) {
+            return -2;
+        }
         return -1;
     }
     logd("inotify_add_watch %d:%s success\n", wd, path);
-    add_path_list(wd, path);
+    add_path_list(fw, wd, path);
     return 0;
 }
 
-int fw_del_watch(int fd, const char *path)
+int fw_del_watch(struct fw *fw, const char *path)
 {
-    wd_path_t *p;
-    for (p = dict; p != NULL; p = (wd_path_t *) (p->hh.next)) {
-        loge("visit p->path=%d:%s, path=%d:%s\n", strlen(p->path), p->path, strlen(path), path);
-        if (!strncmp(p->path, path, strlen(path))) {
+    int fd = fw->fd;
+    int rank = 0;
+    char *key, *val;
+    while (1) {
+        rank = dict_enumerate(fw->dict_path, rank, &key, &val);
+        if (rank < 0) {
+            logd("dict_enumerate end\n");
+            return -1;
+        }
+        if (!strncmp(path, val, strlen(path))) {
+            logd("find key:val = %s:%s\n", key, val);
             break;
         }
     }
-    if (!p) {
-        loge("can't find %d:%s in hash table!\n", fd, path);
-        return -1;
+    int wd = atoi(key);
+    logd("atoi(%s) = %d\n", key, wd);
+    if (-1 == inotify_rm_watch(fd, wd)) {
+        logd("inotify_rm_watch %d failed(%d):%s\n", wd, errno, strerror(errno));
     }
-    int ret = inotify_rm_watch(fd, p->wd);
-    if (ret == -1) {
-        logw("inotify_rm_watch %d failed: %d\n", p->wd, errno);
-    }
-    del_path_list(p->wd);
+    del_path_list(fw, wd);
     return 0;
 }
 
-int fw_add_watch_recursive(int fd, const char *path)
+int fw_add_watch_recursive(struct fw *fw, const char *path)
 {
+    int res;
+    int fd = fw->fd;
     struct dirent *ent = NULL;
     DIR *pdir = NULL;
     char full_path[PATH_MAX];
@@ -110,8 +122,12 @@ int fw_add_watch_recursive(int fd, const char *path)
     }
     pdir = opendir(path);
     if (!pdir) {
-        loge("opendir %s failed: %d\n", path, errno);
-        return -1;
+        loge("opendir %s failed(%d): %s\n", path, errno, strerror(errno));
+        if (errno == EMFILE) {
+            return -2;//stop recursive
+        } else {
+            return -1;//continue recursive
+        }
     }
 
     while (NULL != (ent = readdir(pdir))) {
@@ -119,31 +135,43 @@ int fw_add_watch_recursive(int fd, const char *path)
             if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
                 continue;
             sprintf(full_path, "%s/%s", path, ent->d_name);
-            fw_add_watch_recursive(fd, full_path);
+            res = fw_add_watch_recursive(fw, full_path);
+            if (res == -2) {
+                return -2;
+            }
         } else if (ent->d_type == DT_REG){
             sprintf(full_path, "%s/%s", path, ent->d_name);
-            fw_add_watch(fd, full_path, mask);
+            res = fw_add_watch(fw, full_path, mask);
+            if (res == -2) {
+                return -2;
+            }
         }
     }
-    fw_add_watch(fd, path, mask);
+    fw_add_watch(fw, path, mask);
     closedir(pdir);
     return 0;
 }
 
-int fw_del_watch_recursive(int fd, const char *path)
+int fw_del_watch_recursive(struct fw *fw, const char *path)
 {
-    wd_path_t *p;
-    for (p = dict; p != NULL; p = (wd_path_t *) (p->hh.next)) {
-        if (!strncmp(p->path, path, strlen(path))) {
-            fw_del_watch(fd, path);
+    int rank = 0;
+    char *key, *val;
+    while (1) {
+        rank = dict_enumerate(fw->dict_path, rank, &key, &val);
+        if (rank < 0) {
+            logd("dict_enumerate end\n");
+            break;
+        }
+        if (!strncmp(path, val, strlen(path))) {
+            logd("find key:val = %s:%s\n", key, val);
+            fw_del_watch(fw, path);
         }
     }
     return 0;
 }
 
-int fw_update_watch(int fd, struct inotify_event *iev)
+int fw_update_watch(struct fw *fw, struct inotify_event *iev)
 {
-    wd_path_t *p = NULL;
     char full_path[PATH_MAX];
     uint32_t mask = IN_CREATE | IN_DELETE;
 #if WATCH_MOVED
@@ -152,114 +180,151 @@ int fw_update_watch(int fd, struct inotify_event *iev)
 #if WATCH_MODIFY
     mask |= IN_MODIFY;
 #endif
-    HASH_FIND_INT(dict, &iev->wd, p);
-    if (!p) {
-        loge("can not find fd=%d in hash table\n", iev->wd);
+    char key[9];
+    memset(key, 0, sizeof(key));
+    snprintf(key, 9, "%d", iev->wd);
+    char *path = (char *)dict_get(fw->dict_path, key, NULL);
+    if (!path) {
+        loge("dict_get NULL key=%s\n", key);
         return -1;
     }
+    logd("dict_get key:val = %s:%s\n", key, path);
     memset(full_path, 0, sizeof(full_path));
-    sprintf(full_path, "%s/%s", p->path, iev->name);
+    sprintf(full_path, "%s/%s", path, iev->name);
     logd("fw_update_watch iev->mask = %p, path=%s\n", iev->mask, full_path);
     if (iev->mask & IN_CREATE) {
         if (iev->mask & IN_ISDIR) {
-            logd("create dir %s\n", full_path);
-            fw_add_watch_recursive(fd, full_path);
+            logi("[CREATE DIR] %s\n", full_path);
+            fw_add_watch_recursive(fw, full_path);
         } else {
-            logd("create file %s\n", full_path);
-            fw_add_watch(fd, full_path, mask);
+            logi("[CREATE FILE] %s\n", full_path);
+            fw_add_watch(fw, full_path, mask);
         }
     } else if (iev->mask & IN_DELETE) {
         if (iev->mask & IN_ISDIR) {
-            logd("delete dir %s\n", full_path);
-            fw_del_watch_recursive(fd, full_path);
+            logi("[DELETE DIR] %s\n", full_path);
+            fw_del_watch_recursive(fw, full_path);
         } else {
-            logd("delete file %s\n", full_path);
-            fw_del_watch(fd, full_path);
+            logi("[DELETE FILE] %s\n", full_path);
+            fw_del_watch(fw, full_path);
         }
     } else if (iev->mask & IN_MOVED_FROM){
         if (iev->mask & IN_ISDIR) {
-            logi("dir moved_from %s\n", full_path);
-            fw_del_watch_recursive(fd, full_path);
+            logi("[MOVE DIR FROM] %s\n", full_path);
+            fw_del_watch_recursive(fw, full_path);
         } else {
-            logi("file moved_from %s\n", full_path);
-            fw_del_watch(fd, full_path);
+            logi("[MOVE FILE FROM] %s\n", full_path);
+            fw_del_watch(fw, full_path);
         }
     } else if (iev->mask & IN_MOVED_TO){
         if (iev->mask & IN_ISDIR) {
-            logi("dir moved_to %s\n", full_path);
-            fw_add_watch_recursive(fd, full_path);
+            logi("[MOVE DIR TO] %s\n", full_path);
+            fw_add_watch_recursive(fw, full_path);
         } else {
-            logi("file moved_to %s\n", full_path);
-            fw_add_watch(fd, full_path, mask);
+            logi("[MOVE FILE TO] %s\n", full_path);
+            fw_add_watch(fw, full_path, mask);
         }
     } else if (iev->mask & IN_IGNORED){
-        logi("ignored, file watch was removed\n");
+        logd("ignored, file %s watch was removed\n", path);
+    } else if (iev->mask & IN_MODIFY){
+        logi("[MODIFY FILE] %s\n", full_path);
     } else {
         logi("unknown inotify_event:%p\n", iev->mask);
     }
     return 0;
 }
 
-int fw_init()
+struct fw *fw_init()
 {
-    int ifd = inotify_init();
-    if (ifd == -1) {
-        loge("inotify_init failed: %d\n", errno);
-        return -1;
+    struct fw *fw = CALLOC(1, struct fw);
+    if (!fw) {
+        loge("malloc fw failed\n");
+        goto err;
     }
-    g_evbase = gevent_base_create();
-    if (!g_evbase) {
+    int fd = inotify_init();
+    if (fd == -1) {
+        loge("inotify_init failed(%d)\n", errno, strerror(errno));
+        goto err;
+    }
+    struct gevent_base *evbase = gevent_base_create();
+    if (!evbase) {
         loge("gevent_base_create failed\n");
-        return -1;
+        goto err;
     }
-    return ifd;
+    fw->fd = fd;
+    fw->evbase = evbase;
+    fw->dict_path = dict_new();
+    return fw;
+err:
+    if (fw) {
+        free(fw);
+    }
+    return NULL;
 }
 
 void on_read_ops(int fd, void *arg)
 {
+#define INOTIFYEVENTBUFSIZE (1024)
     int i, len;
-    char ibuf[INOTIFYEVENTBUFSIZE] __attribute__ ((aligned(4))) = {0};
     struct inotify_event *iev;
+    size_t iev_size;
+    char ibuf[INOTIFYEVENTBUFSIZE] __attribute__ ((aligned(4))) = {0};
+    struct fw *fw = (struct fw *)arg;
 
-    logv("on_read_ops\n");
-retry:
-    len = read(fd, ibuf, INOTIFYEVENTBUFSIZE);
+    logd("on_read_ops\n");
+again:
+    len = read(fd, ibuf, sizeof(ibuf));
     if (len == 0) {
-        loge("read inofity event buffer error: %s\n", strerror(errno));
+        loge("read inofity event buffer 0, error: %s\n", strerror(errno));
     } else if (len == -1) {
         loge("read inofity event buffer error: %s\n", strerror(errno));
-        if (errno == EINTR) goto retry;
+        if (errno == EINTR) {
+            loge("errno=EINTR\n");
+            goto again;
+        }
     } else {
+        logd("read len = %d\n", len);
         i = 0;
         while (i < len) {
             iev = (struct inotify_event *)(ibuf + i);
-            fw_update_watch(fd, iev);
-            i += sizeof(struct inotify_event) + iev->len;
+            if (iev->len > 0) {
+                logd("iev->len=%d, name=%s\n", iev->len, iev->name);
+                fw_update_watch(fw, iev);
+            } else {
+                logd("iev->len=%d\n", iev->len);
+            }
+            iev_size = sizeof(struct inotify_event) + iev->len;
+            i += iev_size;
         }
     }
 }
 
-int fw_dispatch()
+int fw_dispatch(struct fw *fw)
 {
+    int fd = fw->fd;
     struct gevent *ev;
-    struct gevent_cbs *evcb = (struct gevent_cbs *)calloc(1, sizeof(struct gevent_cbs));
-    evcb->ev_in = on_read_ops;
-    evcb->ev_out = NULL;
-    evcb->ev_err = NULL;
-    ev = gevent_create(g_ifd, on_read_ops, NULL, NULL, NULL);
-    gevent_add(g_evbase, ev);
+    struct gevent_base *evbase = fw->evbase;
+    ev = gevent_create(fd, on_read_ops, NULL, NULL, fw);
+    gevent_add(evbase, ev);
     logi("file watcher start running...\n");
-    gevent_base_loop(g_evbase);
+    gevent_base_loop(evbase);
     return 0;
 }
 
 void ctrl_c_op(int signo)
 {
-    wd_path_t *user;
-    for (user = dict; user != NULL; user = (wd_path_t *) (user->hh.next)) {
-        logd("user %d, path %s\n", user->wd, user->path);
-        inotify_rm_watch(g_ifd, user->wd);
-        free(user);
+    int fd = _fw->fd;
+    int rank = 0;
+    char *key, *val;
+    while (1) {
+        rank = dict_enumerate(_fw->dict_path, rank, &key, &val);
+        if (rank < 0) {
+            logd("dict_enumerate end\n");
+            break;
+        }
+        int wd = atoi(key);
+        inotify_rm_watch(fd, wd);
+        free(val);
     }
     logi("file_watcher exit\n");
     exit(0);
@@ -285,14 +350,13 @@ int main(int argc, char **argv)
     } else {
         log_init(LOG_STDERR, NULL);
     }
-    log_set_level(LOG_INFO);
     signal(SIGINT , ctrl_c_op);
-    g_ifd = fw_init();
-    if (g_ifd == -1) {
+    _fw = fw_init();
+    if (!_fw) {
         loge("fw_init failed!\n");
         return -1;
     }
-    fw_add_watch_recursive(g_ifd, FTP_ROOT_DIR);
-    fw_dispatch();
+    fw_add_watch_recursive(_fw, FTP_ROOT_DIR);
+    fw_dispatch(_fw);
     return 0;
 }
