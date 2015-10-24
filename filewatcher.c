@@ -345,7 +345,7 @@ int main(int argc, char **argv)
     if (argc == 2) {
         if (!strcmp(argv[1], "-d")) {
             daemon(0, 0);
-            log_init(LOG_RSYSLOG, "file_watcher");
+            log_init(LOG_RSYSLOG, "local1");
         }
     } else {
         log_init(LOG_STDERR, NULL);
