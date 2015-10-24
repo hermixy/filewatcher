@@ -16,7 +16,7 @@
 #include <libgzf.h>
 #include <libdict.h>
 #include <libgevent.h>
-#include <liblog.h>
+#include <libglog.h>
 #include "uthash.h"
 
 #define WATCH_MOVED     1
@@ -345,7 +345,7 @@ int main(int argc, char **argv)
     if (argc == 2) {
         if (!strcmp(argv[1], "-d")) {
             daemon(0, 0);
-            log_init(LOG_FILE, NULL);
+            log_init(LOG_RSYSLOG, "file_watcher");
         }
     } else {
         log_init(LOG_STDERR, NULL);
