@@ -16,7 +16,7 @@
 #include <libgzf.h>
 #include <libdict.h>
 #include <libgevent.h>
-#include <libglog.h>
+#include <liblog.h>
 #include "uthash.h"
 
 #define WATCH_MOVED     1

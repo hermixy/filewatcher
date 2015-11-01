@@ -36,7 +36,7 @@ CFLAGS	+= -Werror
 
 LDFLAGS	:= $($(ARCH)_LDFLAGS)
 LDFLAGS	+= -pthread
-LDFLAGS	+= -lglog
+LDFLAGS	+= -llog
 LDFLAGS	+= -ldict
 LDFLAGS	+= -lgevent
 
