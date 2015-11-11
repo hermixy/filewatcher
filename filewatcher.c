@@ -17,7 +17,6 @@
 #include <libdict.h>
 #include <libgevent.h>
 #include <liblog.h>
-#include "uthash.h"
 
 #define WATCH_MOVED     1
 #define WATCH_MODIFY    1
@@ -27,7 +26,6 @@
 typedef struct path_dict {
     int wd;
     char path[PATH_MAX];
-    UT_hash_handle hh;
 } path_dict_t;
 
 typedef struct fw {
